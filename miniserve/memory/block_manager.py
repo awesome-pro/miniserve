@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 from array import array
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -68,7 +68,11 @@ class MemoryStats:
 
     @property
     def internal_fragmentation(self) -> float:
-        """Share of allocated capacity that is reserved but not holding tokens."""
+        """Share of allocated capacity that is reserved but not holding tokens.
+
+        ``used_tokens`` counts each physical slot once, so this stays within
+        ``[0, 1]`` even when requests share cached prefix blocks.
+        """
         if self.allocated_tokens == 0:
             return 0.0
         return (self.allocated_tokens - self.used_tokens) / self.allocated_tokens
@@ -77,14 +81,15 @@ class MemoryStats:
 class BlockPlan:
     """A transactional view of the KV pool for one planning step.
 
-    Holds the real manager plus the blocks already promised to other requests and
-    the requests being evicted, all within one step, so every "does this fit?"
-    question has a single answer. Nothing here touches the manager: blocks are only
-    really taken or released when the engine commits the plan. That is what makes
-    the plan speculative and keeps planning separate from committing.
+    Holds the real manager plus the blocks already promised to other requests, the
+    cached-prefix attachments planned for this step, and the requests being evicted,
+    all within one step, so every "does this fit?" question has a single answer.
+    Nothing here touches the manager: blocks are only really taken or released when
+    the engine commits the plan. That is what makes the plan speculative and keeps
+    planning separate from committing.
     """
 
-    __slots__ = ("_claims", "_reserved", "_victims", "manager")
+    __slots__ = ("_attachments", "_claims", "_reserved", "_victims", "manager")
 
     def __init__(
         self,
@@ -92,6 +97,7 @@ class BlockPlan:
         claims: Mapping[str, int] | None = None,
         victims: Mapping[str, int] | None = None,
         reserved: int = 0,
+        attachments: Mapping[str, Sequence[int]] | None = None,
     ) -> None:
         self.manager = manager
         self._claims: dict[str, int] = dict(claims or {})
@@ -99,6 +105,13 @@ class BlockPlan:
         #: Distinct blocks this step's cached-prefix attachments take from the pool.
         #: A block shared by several requests is counted once, because it is lost once.
         self._reserved = reserved
+        #: Blocks each request would attach if it ran. A surviving attachment keeps
+        #: its blocks referenced, so evicting one of their current owners does not
+        #: make them reclaimable.
+        self._attachments: dict[str, tuple[int, ...]] = {
+            request_id: tuple(blocks)
+            for request_id, blocks in (attachments or {}).items()
+        }
 
     @property
     def block_size(self) -> int:
@@ -125,8 +138,31 @@ class BlockPlan:
         )
 
     def evict(self, request_id: str, blocks_freed: int) -> None:
-        """Mark a request as evicted, releasing its blocks in this plan only."""
+        """Mark a request as evicted, releasing its blocks in this plan only.
+
+        ``blocks_freed`` must be the physical blocks that actually become
+        reclaimable, not the victim's token footprint: a block still referenced by
+        another request is not capacity the eviction returns.
+        """
         self._victims[request_id] = max(0, blocks_freed)
+
+    def reclaimable_blocks(self, request: Request) -> int:
+        """Physical blocks this eviction would release, given the victims so far.
+
+        A block shared by several victims is counted once, when the last of them is
+        evicted, so ``sum(plan.victims().values())`` stays the number of distinct
+        blocks the plan frees. A block a surviving request will attach is not
+        reclaimed: the attachment keeps it referenced.
+        """
+        protected = {
+            block
+            for request_id, blocks in self._attachments.items()
+            if request_id not in self._victims
+            for block in blocks
+        }
+        return self.manager.blocks_reclaimable_by(
+            request, releasing=self._victims.keys(), protected=protected
+        )
 
     def is_evicted(self, request_id: str) -> bool:
         return request_id in self._victims
@@ -299,6 +335,24 @@ class PagedBlockManager:
     def num_shared_blocks(self) -> int:
         return sum(1 for owners in self._owners.values() if len(owners) > 1)
 
+    def num_used_tokens(self) -> int:
+        """Unique physical KV slots backing live requests.
+
+        Counted per referenced block rather than per request, so a prefix block
+        shared by several requests contributes its slots once. Cached blocks with no
+        owner are free capacity, not allocated occupancy, and are not counted.
+        """
+        occupied: dict[int, int] = {}
+        for request in self._owned.values():
+            remaining = request.num_computed_tokens
+            for block in request.block_table.physical_blocks:
+                if remaining <= 0:
+                    break
+                slots = min(self.block_size, remaining)
+                occupied[block] = max(occupied.get(block, 0), slots)
+                remaining -= slots
+        return sum(occupied.values())
+
     @property
     def prefix_cache_hits(self) -> int:
         """How many times a request inherited a cached prefix."""
@@ -386,6 +440,36 @@ class PagedBlockManager:
         """
         needed = blocks_for_tokens(request.tokens_needed_in_full(), self.block_size)
         return needed <= self.num_blocks
+
+    def blocks_reclaimable_by(
+        self,
+        request: Request,
+        *,
+        releasing: Iterable[str] = (),
+        protected: Iterable[int] = (),
+    ) -> int:
+        """Physical blocks that return to the pool when ``request`` releases its KV.
+
+        A block shared with another request survives that release, so only blocks
+        whose last owner is going away count. ``releasing`` names requests already
+        being released by the same plan; a block shared between two victims is
+        counted once, when the second one goes. ``protected`` names blocks a
+        surviving attachment keeps referenced, so they are not reclaimed either.
+        """
+        already = frozenset(releasing)
+        protected_blocks = frozenset(protected)
+        owners_after = already | {request.id}
+        reclaimable = 0
+        for block in request.block_table.physical_blocks:
+            if block in protected_blocks:
+                continue
+            owners = self._owners.get(block)
+            if not owners or owners <= already:
+                # Free/unknown, or already made reclaimable by an earlier victim.
+                continue
+            if owners <= owners_after:
+                reclaimable += 1
+        return reclaimable
 
     def max_prefill_chunk(
         self,
@@ -598,7 +682,7 @@ class PagedBlockManager:
             free_blocks=self.num_free_blocks(),
             allocated_blocks=self.num_allocated_blocks,
             sequences=len(self._owned),
-            used_tokens=sum(r.num_computed_tokens for r in self._owned.values()),
+            used_tokens=self.num_used_tokens(),
             block_size=self.block_size,
             cached_blocks=self.num_cached_blocks,
             shared_blocks=self.num_shared_blocks,

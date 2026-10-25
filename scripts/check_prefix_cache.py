@@ -196,6 +196,40 @@ def check_shared_blocks_outlive_one_owner() -> None:
     assert manager.num_free_blocks() == 8, "cached blocks count as free capacity"
 
 
+def check_preemption_reclaims_shared_blocks_only_at_the_last_owner() -> None:
+    """A block shared by two victims is freed once, when the second one goes."""
+    manager = PagedBlockManager(8, 4, enable_prefix_cache=True)
+    prompt = [1, 2, 3, 4] * 2
+    seed = request(prompt, req_id="seed")
+    allocate(manager, seed, len(prompt))
+    manager.free(seed)
+
+    first = request(prompt, req_id="first")
+    second = request(prompt, req_id="second")
+    for owner in (first, second):
+        position, blocks = manager.cached_prefix(owner)
+        manager.attach_prefix(owner, blocks)
+        owner.on_prefill(position - owner.num_computed_tokens)
+    assert manager.num_shared_blocks == 2
+
+    plan = manager.block_plan()
+    freed = plan.reclaimable_blocks(first)
+    assert freed == 0, "the other owner still holds the prefix"
+    plan.evict(first.id, freed)
+    assert plan.blocks_freed == 0
+
+    freed = plan.reclaimable_blocks(second)
+    assert freed == 2, "the last owner releases both shared blocks"
+    plan.evict(second.id, freed)
+    assert plan.blocks_freed == 2, "shared blocks are counted once, not per victim"
+
+    manager.free(first)
+    assert manager.num_free_blocks() == 6, "the prefix survives the first owner"
+    manager.free(second)
+    assert manager.num_free_blocks() == 8, "the last owner returns the whole prefix"
+    manager.assert_invariants()
+
+
 def check_cached_blocks_are_evicted_before_capacity_runs_out() -> None:
     """A cached block is free capacity: the pool evicts the coldest one on demand."""
     manager = PagedBlockManager(4, 4, enable_prefix_cache=True)
@@ -314,10 +348,20 @@ def check_shared_blocks_survive_a_real_engine_run() -> None:
     for index in range(12):
         engine.submit(request([*SHARED, 90, 91 + index], arrival=0.05 * index, req_id=f"r{index}"))
 
+    shared_steps = 0
     for _step in engine.run():
         memory = engine.memory
         assert memory is not None
         memory.assert_invariants()
+        stats = memory.stats()
+        assert stats.used_tokens <= stats.allocated_tokens
+        assert 0.0 <= stats.internal_fragmentation <= 1.0
+        if stats.shared_blocks:
+            shared_steps += 1
+            tracked = memory.tracked_requests()
+            assert stats.used_tokens < sum(r.num_computed_tokens for r in tracked), (
+                "a shared slot must be counted once, not once per owner"
+            )
         for request_obj in engine.requests.values():
             if request_obj.is_finished:
                 assert request_obj.block_table.num_blocks == 0
@@ -331,6 +375,7 @@ def check_shared_blocks_survive_a_real_engine_run() -> None:
     assert metrics.prefix_cache_hits >= 8, (
         f"expected most requests to hit: {metrics.prefix_cache_hits}"
     )
+    assert shared_steps > 0, "the run must include steps with physically shared blocks"
     for request_obj in engine.requests.values():
         assert request_obj.status is RequestStatus.FINISHED
         assert request_obj.num_generated == 3
@@ -379,6 +424,10 @@ def main() -> int:
     check("a second request shares the same blocks", check_a_second_request_shares_the_same_blocks)
     check("a hit stops at the first divergence", check_a_hit_stops_at_the_first_divergence)
     check("shared blocks outlive one owner", check_shared_blocks_outlive_one_owner)
+    check(
+        "preemption releases shared blocks at the last owner",
+        check_preemption_reclaims_shared_blocks_only_at_the_last_owner,
+    )
     check(
         "cached blocks are evicted before capacity runs out",
         check_cached_blocks_are_evicted_before_capacity_runs_out,

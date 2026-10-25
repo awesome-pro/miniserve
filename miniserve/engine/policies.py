@@ -44,7 +44,6 @@ from miniserve.engine.scheduler import ScheduledKind, ScheduledWork, SchedulerOu
 from miniserve.memory.block_manager import (
     BlockPlan,
     PagedBlockManager,
-    blocks_for_tokens,
 )
 
 PHASE_ORDER = ("decode", "prefill")
@@ -124,7 +123,10 @@ class SchedulerBase:
             victims = self.plan.victims()
             self._reset_step_state()
             self.plan = BlockPlan(
-                self.memory, victims=victims, reserved=self.reserved_blocks
+                self.memory,
+                victims=victims,
+                reserved=self.reserved_blocks,
+                attachments=self.planned_attachments,
             )
             work = []
             self._build_plan(work, waiting, running, budget)
@@ -177,6 +179,11 @@ class SchedulerBase:
     def reserved_blocks(self) -> int:
         """Distinct blocks this step's attachments will take from the free pool."""
         return len(self._reserved_ids)
+
+    @property
+    def planned_attachments(self) -> dict[str, tuple[int, ...]]:
+        """Cached-prefix blocks each request would attach if it ran this step."""
+        return {request_id: blocks for request_id, (_, blocks) in self._hits.items()}
 
     def _cursor(self, request: Request) -> int:
         """Where this request's compute starts: past any cached prefix it will share."""
@@ -241,7 +248,11 @@ class SchedulerBase:
 
     def _reset_step_state(self) -> None:
         self.plan = (
-            BlockPlan(self.memory, reserved=self.reserved_blocks)
+            BlockPlan(
+                self.memory,
+                reserved=self.reserved_blocks,
+                attachments=self.planned_attachments,
+            )
             if self.memory is not None
             else None
         )
@@ -441,13 +452,15 @@ class SchedulerBase:
                     break
                 if not self._can_preempt(victim, requester):
                     continue
-                # The victim's *committed* blocks come back, not the ones a cached
-                # prefix might have added: an evicted request is dropped from the plan,
-                # so its attach never happens.
-                freed = blocks_for_tokens(
-                    victim.num_computed_tokens, self.plan.block_size
-                )
-                if freed <= 0:
+                # The victim's *committed* blocks come back, and only those whose
+                # last owner is going away: a cached prefix shared with a surviving
+                # request is not capacity the requester can use. An evicted request
+                # is dropped from the plan, so its attach never happens.
+                freed = self.plan.reclaimable_blocks(victim)
+                if not victim.block_table.num_blocks and self.plan.claim_of(victim.id) <= 0:
+                    # Nothing committed and nothing claimed: evicting it cannot fund
+                    # anyone. A victim whose blocks are all shared is still evicted,
+                    # because a later co-owner can then make them reclaimable.
                     continue
                 self.plan.evict(victim.id, freed)
                 preemptions[victim.id] = requester_id

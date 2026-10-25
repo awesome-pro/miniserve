@@ -162,6 +162,49 @@ def check_stats_report_fragmentation() -> None:
     assert stats.internal_fragmentation == 0.75, "12 of 16 reserved tokens are unused"
 
 
+def check_stats_count_shared_physical_slots_once() -> None:
+    """used_tokens is physical occupancy, not the sum of request cursors."""
+    manager = PagedBlockManager(num_blocks=8, block_size=4, enable_prefix_cache=True)
+    seed = make_request(8, 1, req_id="seed")
+    manager.grow_to(seed, seed.prompt_len)
+    seed.on_prefill(seed.prompt_len)
+    manager.free(seed)
+    assert manager.stats().used_tokens == 0
+
+    first = make_request(8, 2, req_id="first")
+    second = make_request(8, 2, req_id="second")
+    for request in (first, second):
+        position, blocks = manager.cached_prefix(request)
+        manager.attach_prefix(request, blocks)
+        request.on_prefill(position - request.num_computed_tokens)
+
+    stats = manager.stats()
+    assert stats.used_tokens == 8, "the shared blocks hold eight unique physical slots"
+    assert stats.allocated_blocks == 2
+    assert stats.allocated_tokens == 8
+    assert stats.internal_fragmentation == 0.0
+    assert 0.0 <= stats.internal_fragmentation <= 1.0
+
+    first.on_decode(token=0, now=0.0)
+    manager.grow_to(first, first.num_computed_tokens)
+    stats = manager.stats()
+    assert stats.used_tokens == 9, "eight shared slots plus first's private tail"
+    assert stats.allocated_blocks == 3
+    assert stats.allocated_tokens == 12
+    assert stats.internal_fragmentation == 0.25
+    assert stats.used_tokens <= stats.allocated_tokens
+    manager.assert_invariants()
+
+    manager.free(second)
+    assert manager.stats().used_tokens == 9, "first still holds the shared prefix"
+    manager.free(first)
+    stats = manager.stats()
+    assert stats.used_tokens == 0
+    assert stats.allocated_tokens == 0
+    assert stats.internal_fragmentation == 0.0
+    manager.assert_invariants()
+
+
 # ------------------------------------------------------------ engine integration
 
 
@@ -342,6 +385,10 @@ def main() -> int:
     check("freeing an unowned block is rejected", check_freeing_an_unowned_block_is_rejected)
     check("partial tail block is reused", check_partial_tail_block_is_reused_before_a_new_block)
     check("stats report fragmentation", check_stats_report_fragmentation)
+    check(
+        "stats count shared physical slots once",
+        check_stats_count_shared_physical_slots_once,
+    )
     check(
         "engine blocks match each sequence", check_engine_allocates_blocks_that_match_each_sequence
     )

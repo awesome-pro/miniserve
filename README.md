@@ -9,7 +9,7 @@ block-based KV management · content-addressed prefix caching · real Llama-fami
 
 ```text
 Python 3.12+   ·   dependency-free core   ·   optional PyTorch runner
-155 checks   ·   5 policy configurations   ·   3 arrival processes   ·   14 reproducible figures
+160 checks   ·   5 policy configurations   ·   3 arrival processes   ·   14 reproducible figures
 ```
 
 MiniServe turns concurrent generation requests into scheduled model-execution steps. On every engine step it decides which requests run, how many tokens each request computes, and which physical KV blocks back those tokens.
@@ -30,7 +30,7 @@ The focus is the serving control plane: scheduling, admission, KV-memory managem
 | Workloads | burst, Poisson open-loop, closed-loop concurrency |
 | Metrics | TTFT, ITL, TPOT, E2E, queue time, throughput, KV utilization, fragmentation |
 | Execution | deterministic simulated runner + real Llama-family runner over block-managed KV tensors |
-| Validation | 155 checks; real-model logits and greedy tokens compared against Hugging Face |
+| Validation | 160 checks; real-model logits and greedy tokens compared against Hugging Face |
 
 ---
 
@@ -182,7 +182,7 @@ The same run's KV occupancy:
 
 ![KV and load](figures/kv_and_load.png)
 
-The dashed line is internal fragmentation: reserved block capacity that does not currently hold sequence tokens.
+The dashed line is internal fragmentation: allocated physical block capacity that does not currently hold unique sequence KV, with a shared prefix block counted once.
 
 A latency distribution from the 16 req/s point of the capacity experiment:
 
@@ -398,7 +398,7 @@ Definitions follow common LLM-serving usage:
 | Queue time | arrival → first scheduled execution |
 | Throughput | generated tokens per second of benchmark time |
 | KV utilization | allocated blocks / total blocks, sampled per step |
-| Internal fragmentation | allocated block capacity not occupied by sequence tokens |
+| Internal fragmentation | allocated physical block capacity not occupied by unique sequence KV slots (shared blocks counted once) |
 | Decode batch | decoding requests per step |
 | Prefill size | prefill/recompute tokens per step |
 

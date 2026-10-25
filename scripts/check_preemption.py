@@ -192,6 +192,171 @@ def check_no_thrashing_under_randomized_pressure() -> None:
         assert request.block_table.num_blocks == 0
 
 
+def check_shared_prefix_blocks_are_not_freed_while_shared() -> None:
+    """Evicting a co-owner must not count blocks the survivor still references.
+
+    Two requests share a four-block cached prefix and each owns one private tail
+    block in a six-block pool. Evicting one returns one block, not the five its
+    cursor covers, so a third request needing two blocks must wait rather than be
+    scheduled against memory that does not exist.
+    """
+    engine = Engine(
+        EngineConfig(
+            max_batch_tokens=9,
+            max_running_requests=3,
+            num_blocks=6,
+            block_size=2,
+            enable_prefix_cache=True,
+            enable_preemption=True,
+            runner=ZERO_COST,
+        )
+    )
+    prefix = list(range(8))
+    first = engine.submit(
+        Request(prompt_tokens=[*prefix, 100], max_new_tokens=3, arrival_time=0.0, id="first")
+    )
+    engine.step()  # compute and index the shared prefix
+    now = engine.clock.now()
+    second = engine.submit(
+        Request(
+            prompt_tokens=[*prefix, 200],
+            max_new_tokens=3,
+            arrival_time=now,
+            id="second",
+        )
+    )
+    engine.submit(
+        Request(
+            prompt_tokens=[900, 901, 902, 903],
+            max_new_tokens=1,
+            arrival_time=now,
+            id="third",
+        )
+    )
+    engine.step()  # second attaches the prefix and fills the last free block
+
+    memory = engine.memory
+    assert memory is not None
+    shared = set(first.block_table.physical_blocks) & set(
+        second.block_table.physical_blocks
+    )
+    assert len(shared) == 4, "the four prefix blocks must be physically shared"
+    assert memory.num_free_blocks() == 0, "the pool is full"
+    assert second.num_preemptions == 0
+
+    # This step must evict second (reclaiming one block) and leave third waiting.
+    # Before the fix it counted the shared prefix as freed and over-allocated.
+    steps = engine.run_to_completion(max_steps=1000)
+
+    memory.assert_invariants()
+    assert len(engine.finished) == 3, "the shared-prefix pressure must still drain"
+    assert second.num_preemptions >= 1, "the shared prefix's co-owner must be the victim"
+    for step in steps:
+        assert step.free_blocks is not None and step.free_blocks >= 0
+    assert memory.num_free_blocks() == memory.num_blocks, "no block leaked"
+
+
+def check_same_step_attachment_keeps_victim_blocks_referenced() -> None:
+    """A victim's block attached by a survivor is not capacity for that step.
+
+    All four requests share a six-token prefix. When the planner evicts a request
+    whose private tail block is also part of a waiting request's cached prefix, the
+    attachment will keep that block referenced; counting it as freed over-allocates
+    the pool.
+    """
+    engine = Engine(
+        EngineConfig(
+            max_batch_tokens=12,
+            max_running_requests=3,
+            num_blocks=10,
+            block_size=2,
+            enable_prefix_cache=True,
+            enable_preemption=True,
+            runner=ZERO_COST,
+        )
+    )
+    prefix = list(range(6))
+    specs = (
+        ([*prefix, 1000, 1000, 1000, 1000], 2, "r0"),
+        ([*prefix, 1001, 1001, 1001, 1001], 7, "r1"),
+        ([*prefix, 1002, 1002], 3, "r2"),
+        ([*prefix, 1003, 1003, 1003], 11, "r3"),
+    )
+    for prompt, max_new, req_id in specs:
+        engine.submit(
+            Request(
+                prompt_tokens=prompt,
+                max_new_tokens=max_new,
+                arrival_time=0.0,
+                id=req_id,
+            )
+        )
+
+    steps = engine.run_to_completion(max_steps=1000)
+
+    memory = engine.memory
+    assert memory is not None
+    memory.assert_invariants()
+    assert len(engine.finished) == len(specs), "the pressure must drain"
+    assert any(step.preemptions for step in steps), "this pool must force an eviction"
+    for step in steps:
+        assert step.free_blocks is not None and step.free_blocks >= 0
+        stats = memory.stats()
+        assert stats.used_tokens <= stats.allocated_tokens
+        assert 0.0 <= stats.internal_fragmentation <= 1.0
+    assert memory.num_free_blocks() == memory.num_blocks, "no block leaked"
+
+
+def check_repeated_preemption_keeps_the_pool_consistent() -> None:
+    """A request evicted more than once must not over-allocate or leak blocks."""
+    engine = Engine(
+        EngineConfig(
+            max_batch_tokens=12,
+            max_running_requests=3,
+            num_blocks=16,
+            block_size=2,
+            enable_prefix_cache=True,
+            enable_preemption=True,
+            runner=ZERO_COST,
+        )
+    )
+    prefix = list(range(6))
+    arrivals = (
+        ([*prefix, 1000, 1000], 12, 0.005, "r0"),
+        ([*prefix, 1001, 1001, 1001], 8, 0.01, "r1"),
+        ([*prefix, 1002, 1002], 12, 0.01, "r2"),
+        ([*prefix, 1003, 1003, 1003], 2, 0.01, "r3"),
+    )
+    for prompt, max_new, arrival, req_id in arrivals:
+        engine.submit_at(
+            Request(
+                prompt_tokens=prompt,
+                max_new_tokens=max_new,
+                arrival_time=arrival,
+                id=req_id,
+            )
+        )
+
+    steps = engine.run_to_completion(max_steps=2000)
+
+    memory = engine.memory
+    assert memory is not None
+    memory.assert_invariants()
+    assert len(engine.finished) == len(arrivals), "every request must still finish"
+    assert max(r.num_preemptions for r in engine.requests.values()) >= 2, (
+        "this workload must evict at least one request twice"
+    )
+    for step in steps:
+        stats = memory.stats()
+        assert stats.used_tokens <= stats.allocated_tokens, "shared slots counted once"
+        assert 0.0 <= stats.internal_fragmentation <= 1.0
+        assert step.free_blocks is not None and step.free_blocks >= 0
+    assert memory.num_free_blocks() == memory.num_blocks, "no block leaked"
+    for request in engine.requests.values():
+        assert request.num_computed_tokens <= request.num_tokens
+        assert request.num_generated <= request.max_new_tokens
+
+
 def check_planning_never_mutates_memory() -> None:
     """The scheduler decides; only the engine commits.
 
@@ -251,6 +416,18 @@ def main() -> int:
     check("late requests get through under pressure", check_preemption_lets_late_requests_through)
     check("over-subscribed workloads stall cleanly", check_over_subscribed_workload_stalls_cleanly)
     check("randomized pressure terminates", check_no_thrashing_under_randomized_pressure)
+    check(
+        "shared prefix blocks are not counted as freed",
+        check_shared_prefix_blocks_are_not_freed_while_shared,
+    )
+    check(
+        "same-step attachments keep victim blocks referenced",
+        check_same_step_attachment_keeps_victim_blocks_referenced,
+    )
+    check(
+        "repeated preemption keeps the pool consistent",
+        check_repeated_preemption_keeps_the_pool_consistent,
+    )
     check("planning never mutates memory", check_planning_never_mutates_memory)
     check("preemptions are reported as events", check_preemption_events_are_reported)
     return report("phase 3 recompute preemption")
