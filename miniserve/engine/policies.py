@@ -443,11 +443,22 @@ class SchedulerBase:
             if not self.plan.is_evicted(req_id)
         }
 
+        victims = sorted(
+            (
+                r for r in running
+                if r.status in (
+                    RequestStatus.PREFILLING,
+                    RequestStatus.DECODING,
+                )
+            ),
+            key=self.preemption_key,
+        )
+
         for requester_id, blocks_needed in list(remaining.items()):
             requester = pool.get(requester_id)
             if requester is None:  # pragma: no cover - defensive
                 continue
-            for victim in sorted(pool.values(), key=self.preemption_key):
+            for victim in victims:
                 if blocks_needed <= self.plan.free_blocks(requester_id):
                     break
                 if not self._can_preempt(victim, requester):

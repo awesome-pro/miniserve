@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "A miniature LLM inference runtime: continuous batching, chunked prefill, token-budget scheduling and block-based KV cache management."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "py-spy>=0.4.2",
+]
 
 [project.optional-dependencies]
 plot = ["matplotlib>=3.9"]

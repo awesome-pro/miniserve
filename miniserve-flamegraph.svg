@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="314" onload="init(evt)" viewBox="0 0 1200 314" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = true;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="314" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">py-spy record -o miniserve-flamegraph.svg -- python -m miniserve.cli --requests 500 --arrival burst --max-batch-tokens 64 --max-running-requests 4 --num-blocks 256</text><text id="details" fill="rgb(0,0,0)" x="10" y="40.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="303.00"> </text><svg id="frames" x="10" width="1180" total_samples="3857"><g><title>_release_arrivals (miniserve/engine/engine.py:200) (6 samples, 0.16%)</title><rect x="0.4148%" y="180" width="0.1556%" height="15" fill="rgb(227,0,7)" fg:x="16" fg:w="6"/><text x="0.6648%" y="190.50"></text></g><g><title>step (miniserve/engine/engine.py:244) (12 samples, 0.31%)</title><rect x="0.3111%" y="164" width="0.3111%" height="15" fill="rgb(217,0,24)" fg:x="12" fg:w="12"/><text x="0.5611%" y="174.50"></text></g><g><title>_sync_running_set (miniserve/engine/engine.py:232) (7 samples, 0.18%)</title><rect x="0.6482%" y="180" width="0.1815%" height="15" fill="rgb(221,193,54)" fg:x="25" fg:w="7"/><text x="0.8982%" y="190.50"></text></g><g><title>_sync_running_set (miniserve/engine/engine.py:236) (9 samples, 0.23%)</title><rect x="0.9074%" y="180" width="0.2333%" height="15" fill="rgb(248,212,6)" fg:x="35" fg:w="9"/><text x="1.1574%" y="190.50"></text></g><g><title>is_active (miniserve/engine/request.py:33) (9 samples, 0.23%)</title><rect x="0.9074%" y="196" width="0.2333%" height="15" fill="rgb(208,68,35)" fg:x="35" fg:w="9"/><text x="1.1574%" y="206.50"></text></g><g><title>step (miniserve/engine/engine.py:245) (24 samples, 0.62%)</title><rect x="0.6222%" y="164" width="0.6222%" height="15" fill="rgb(232,128,0)" fg:x="24" fg:w="24"/><text x="0.8722%" y="174.50"></text></g><g><title>_sync_running_set (miniserve/engine/engine.py:240) (4 samples, 0.10%)</title><rect x="1.1408%" y="180" width="0.1037%" height="15" fill="rgb(207,160,47)" fg:x="44" fg:w="4"/><text x="1.3908%" y="190.50"></text></g><g><title>_progress_fingerprint (miniserve/engine/engine.py:594) (4 samples, 0.10%)</title><rect x="1.2704%" y="180" width="0.1037%" height="15" fill="rgb(228,23,34)" fg:x="49" fg:w="4"/><text x="1.5204%" y="190.50"></text></g><g><title>&lt;genexpr&gt; (miniserve/engine/engine.py:595) (14 samples, 0.36%)</title><rect x="6.3780%" y="196" width="0.3630%" height="15" fill="rgb(218,30,26)" fg:x="246" fg:w="14"/><text x="6.6280%" y="206.50"></text></g><g><title>__get__ (enum.py:188) (5 samples, 0.13%)</title><rect x="11.7190%" y="212" width="0.1296%" height="15" fill="rgb(220,122,19)" fg:x="452" fg:w="5"/><text x="11.9690%" y="222.50"></text></g><g><title>__get__ (enum.py:195) (7 samples, 0.18%)</title><rect x="11.8486%" y="212" width="0.1815%" height="15" fill="rgb(250,228,42)" fg:x="457" fg:w="7"/><text x="12.0986%" y="222.50"></text></g><g><title>value (enum.py:1325) (10 samples, 0.26%)</title><rect x="12.3671%" y="228" width="0.2593%" height="15" fill="rgb(240,193,28)" fg:x="477" fg:w="10"/><text x="12.6171%" y="238.50"></text></g><g><title>__get__ (enum.py:197) (27 samples, 0.70%)</title><rect x="12.0301%" y="212" width="0.7000%" height="15" fill="rgb(216,20,37)" fg:x="464" fg:w="27"/><text x="12.2801%" y="222.50"></text></g><g><title>value (enum.py:1328) (4 samples, 0.10%)</title><rect x="12.6264%" y="228" width="0.1037%" height="15" fill="rgb(206,188,39)" fg:x="487" fg:w="4"/><text x="12.8764%" y="238.50"></text></g><g><title>num_generated (miniserve/engine/request.py:89) (14 samples, 0.36%)</title><rect x="12.7301%" y="212" width="0.3630%" height="15" fill="rgb(217,207,13)" fg:x="491" fg:w="14"/><text x="12.9801%" y="222.50"></text></g><g><title>&lt;genexpr&gt; (miniserve/engine/engine.py:596) (255 samples, 6.61%)</title><rect x="6.7410%" y="196" width="6.6114%" height="15" fill="rgb(231,73,38)" fg:x="260" fg:w="255"/><text x="6.9910%" y="206.50">&lt;genexpr&gt;..</text></g><g><title>num_generated (miniserve/engine/request.py:91) (10 samples, 0.26%)</title><rect x="13.0931%" y="212" width="0.2593%" height="15" fill="rgb(225,20,46)" fg:x="505" fg:w="10"/><text x="13.3431%" y="222.50"></text></g><g><title>_progress_fingerprint (miniserve/engine/engine.py:595) (476 samples, 12.34%)</title><rect x="1.3741%" y="180" width="12.3412%" height="15" fill="rgb(210,31,41)" fg:x="53" fg:w="476"/><text x="1.6241%" y="190.50">_progress_fingerpr..</text></g><g><title>&lt;genexpr&gt; (miniserve/engine/engine.py:597) (14 samples, 0.36%)</title><rect x="13.3523%" y="196" width="0.3630%" height="15" fill="rgb(221,200,47)" fg:x="515" fg:w="14"/><text x="13.6023%" y="206.50"></text></g><g><title>step (miniserve/engine/engine.py:248) (481 samples, 12.47%)</title><rect x="1.2704%" y="164" width="12.4708%" height="15" fill="rgb(226,26,5)" fg:x="49" fg:w="481"/><text x="1.5204%" y="174.50">step (miniserve/eng..</text></g><g><title>_track_waiting (miniserve/engine/policies.py:269) (12 samples, 0.31%)</title><rect x="14.6487%" y="196" width="0.3111%" height="15" fill="rgb(249,33,26)" fg:x="565" fg:w="12"/><text x="14.8987%" y="206.50"></text></g><g><title>_track_waiting (miniserve/engine/policies.py:270) (117 samples, 3.03%)</title><rect x="14.9598%" y="196" width="3.0334%" height="15" fill="rgb(235,183,28)" fg:x="577" fg:w="117"/><text x="15.2098%" y="206.50">_tr..</text></g><g><title>_track_waiting (miniserve/engine/policies.py:271) (105 samples, 2.72%)</title><rect x="17.9933%" y="196" width="2.7223%" height="15" fill="rgb(221,5,38)" fg:x="694" fg:w="105"/><text x="18.2433%" y="206.50">_t..</text></g><g><title>schedule (miniserve/engine/policies.py:101) (283 samples, 7.34%)</title><rect x="13.8450%" y="180" width="7.3373%" height="15" fill="rgb(247,18,42)" fg:x="534" fg:w="283"/><text x="14.0950%" y="190.50">schedule (..</text></g><g><title>_track_waiting (miniserve/engine/policies.py:272) (18 samples, 0.47%)</title><rect x="20.7156%" y="196" width="0.4667%" height="15" fill="rgb(241,131,45)" fg:x="799" fg:w="18"/><text x="20.9656%" y="206.50"></text></g><g><title>_find_cached_prefixes (miniserve/engine/policies.py:146) (7 samples, 0.18%)</title><rect x="21.2860%" y="196" width="0.1815%" height="15" fill="rgb(249,31,29)" fg:x="821" fg:w="7"/><text x="21.5360%" y="206.50"></text></g><g><title>_find_cached_prefixes (miniserve/engine/policies.py:159) (5 samples, 0.13%)</title><rect x="21.5971%" y="196" width="0.1296%" height="15" fill="rgb(225,111,53)" fg:x="833" fg:w="5"/><text x="21.8471%" y="206.50"></text></g><g><title>schedule (miniserve/engine/policies.py:102) (22 samples, 0.57%)</title><rect x="21.1823%" y="180" width="0.5704%" height="15" fill="rgb(238,160,17)" fg:x="817" fg:w="22"/><text x="21.4323%" y="190.50"></text></g><g><title>__init__ (miniserve/memory/block_manager.py:103) (6 samples, 0.16%)</title><rect x="22.2193%" y="212" width="0.1556%" height="15" fill="rgb(214,148,48)" fg:x="857" fg:w="6"/><text x="22.4693%" y="222.50"></text></g><g><title>_reset_step_state (miniserve/engine/policies.py:251) (26 samples, 0.67%)</title><rect x="21.8045%" y="196" width="0.6741%" height="15" fill="rgb(232,36,49)" fg:x="841" fg:w="26"/><text x="22.0545%" y="206.50"></text></g><g><title>schedule (miniserve/engine/policies.py:103) (49 samples, 1.27%)</title><rect x="21.7527%" y="180" width="1.2704%" height="15" fill="rgb(209,103,24)" fg:x="839" fg:w="49"/><text x="22.0027%" y="190.50"></text></g><g><title>_reset_step_state (miniserve/engine/policies.py:254) (18 samples, 0.47%)</title><rect x="22.5564%" y="196" width="0.4667%" height="15" fill="rgb(229,88,8)" fg:x="870" fg:w="18"/><text x="22.8064%" y="206.50"></text></g><g><title>planned_attachments (miniserve/engine/policies.py:186) (17 samples, 0.44%)</title><rect x="22.5823%" y="212" width="0.4408%" height="15" fill="rgb(213,181,19)" fg:x="871" fg:w="17"/><text x="22.8323%" y="222.50"></text></g><g><title>_schedule_decode (miniserve/engine/policies.py:313) (27 samples, 0.70%)</title><rect x="23.1268%" y="212" width="0.7000%" height="15" fill="rgb(254,191,54)" fg:x="892" fg:w="27"/><text x="23.3768%" y="222.50"></text></g><g><title>&lt;genexpr&gt; (miniserve/engine/policies.py:313) (26 samples, 0.67%)</title><rect x="23.1527%" y="228" width="0.6741%" height="15" fill="rgb(241,83,37)" fg:x="893" fg:w="26"/><text x="23.4027%" y="238.50"></text></g><g><title>is_active (miniserve/engine/request.py:33) (10 samples, 0.26%)</title><rect x="23.5675%" y="244" width="0.2593%" height="15" fill="rgb(233,36,39)" fg:x="909" fg:w="10"/><text x="23.8175%" y="254.50"></text></g><g><title>decode_order_key (miniserve/engine/policies.py:583) (11 samples, 0.29%)</title><rect x="32.3827%" y="228" width="0.2852%" height="15" fill="rgb(226,3,54)" fg:x="1249" fg:w="11"/><text x="32.6327%" y="238.50"></text></g><g><title>_schedule_decode (miniserve/engine/policies.py:315) (349 samples, 9.05%)</title><rect x="23.8268%" y="212" width="9.0485%" height="15" fill="rgb(245,192,40)" fg:x="919" fg:w="349"/><text x="24.0768%" y="222.50">_schedule_dec..</text></g><g><title>decode_order_key (miniserve/engine/policies.py:584) (8 samples, 0.21%)</title><rect x="32.6679%" y="228" width="0.2074%" height="15" fill="rgb(238,167,29)" fg:x="1260" fg:w="8"/><text x="32.9179%" y="238.50"></text></g><g><title>_schedule_decode (miniserve/engine/policies.py:316) (13 samples, 0.34%)</title><rect x="32.8753%" y="212" width="0.3370%" height="15" fill="rgb(232,182,51)" fg:x="1268" fg:w="13"/><text x="33.1253%" y="222.50"></text></g><g><title>_is_decode_work (miniserve/engine/policies.py:236) (5 samples, 0.13%)</title><rect x="33.3420%" y="228" width="0.1296%" height="15" fill="rgb(231,60,39)" fg:x="1286" fg:w="5"/><text x="33.5920%" y="238.50"></text></g><g><title>_is_decode_work (miniserve/engine/policies.py:244) (8 samples, 0.21%)</title><rect x="33.4716%" y="228" width="0.2074%" height="15" fill="rgb(208,69,12)" fg:x="1291" fg:w="8"/><text x="33.7216%" y="238.50"></text></g><g><title>num_uncomputed_tokens (miniserve/engine/request.py:105) (4 samples, 0.10%)</title><rect x="33.7827%" y="244" width="0.1037%" height="15" fill="rgb(235,93,37)" fg:x="1303" fg:w="4"/><text x="34.0327%" y="254.50"></text></g><g><title>_schedule_decode (miniserve/engine/policies.py:318) (29 samples, 0.75%)</title><rect x="33.2123%" y="212" width="0.7519%" height="15" fill="rgb(213,116,39)" fg:x="1281" fg:w="29"/><text x="33.4623%" y="222.50"></text></g><g><title>_is_decode_work (miniserve/engine/policies.py:247) (9 samples, 0.23%)</title><rect x="33.7309%" y="228" width="0.2333%" height="15" fill="rgb(222,207,29)" fg:x="1301" fg:w="9"/><text x="33.9809%" y="238.50"></text></g><g><title>_schedule_decode (miniserve/engine/policies.py:321) (5 samples, 0.13%)</title><rect x="33.9642%" y="212" width="0.1296%" height="15" fill="rgb(206,96,30)" fg:x="1310" fg:w="5"/><text x="34.2142%" y="222.50"></text></g><g><title>_schedule_decode (miniserve/engine/policies.py:334) (9 samples, 0.23%)</title><rect x="34.0939%" y="212" width="0.2333%" height="15" fill="rgb(218,138,4)" fg:x="1315" fg:w="9"/><text x="34.3439%" y="222.50"></text></g><g><title>is_finished (miniserve/engine/request.py:125) (6 samples, 0.16%)</title><rect x="34.1716%" y="228" width="0.1556%" height="15" fill="rgb(250,191,14)" fg:x="1318" fg:w="6"/><text x="34.4216%" y="238.50"></text></g><g><title>_schedule_decode (miniserve/engine/policies.py:336) (5 samples, 0.13%)</title><rect x="34.3272%" y="212" width="0.1296%" height="15" fill="rgb(239,60,40)" fg:x="1324" fg:w="5"/><text x="34.5772%" y="222.50"></text></g><g><title>blocks_for_tokens (miniserve/memory/block_manager.py:22) (8 samples, 0.21%)</title><rect x="34.7420%" y="260" width="0.2074%" height="15" fill="rgb(206,27,48)" fg:x="1340" fg:w="8"/><text x="34.9920%" y="270.50"></text></g><g><title>_decode_extra_blocks (miniserve/engine/policies.py:537) (22 samples, 0.57%)</title><rect x="34.6383%" y="228" width="0.5704%" height="15" fill="rgb(225,35,8)" fg:x="1336" fg:w="22"/><text x="34.8883%" y="238.50"></text></g><g><title>blocks_needed_to_reach (miniserve/memory/block_manager.py:391) (19 samples, 0.49%)</title><rect x="34.7161%" y="244" width="0.4926%" height="15" fill="rgb(250,213,24)" fg:x="1339" fg:w="19"/><text x="34.9661%" y="254.50"></text></g><g><title>blocks_for_tokens (miniserve/memory/block_manager.py:26) (9 samples, 0.23%)</title><rect x="34.9754%" y="260" width="0.2333%" height="15" fill="rgb(247,123,22)" fg:x="1349" fg:w="9"/><text x="35.2254%" y="270.50"></text></g><g><title>_schedule_decode (miniserve/engine/policies.py:347) (37 samples, 0.96%)</title><rect x="34.5087%" y="212" width="0.9593%" height="15" fill="rgb(231,138,38)" fg:x="1331" fg:w="37"/><text x="34.7587%" y="222.50"></text></g><g><title>_decode_extra_blocks (miniserve/engine/policies.py:538) (10 samples, 0.26%)</title><rect x="35.2087%" y="228" width="0.2593%" height="15" fill="rgb(231,145,46)" fg:x="1358" fg:w="10"/><text x="35.4587%" y="238.50"></text></g><g><title>num_blocks (miniserve/block_table.py:27) (4 samples, 0.10%)</title><rect x="35.3643%" y="244" width="0.1037%" height="15" fill="rgb(251,118,11)" fg:x="1364" fg:w="4"/><text x="35.6143%" y="254.50"></text></g><g><title>free_blocks (miniserve/memory/block_manager.py:190) (5 samples, 0.13%)</title><rect x="35.5976%" y="244" width="0.1296%" height="15" fill="rgb(217,147,25)" fg:x="1373" fg:w="5"/><text x="35.8476%" y="254.50"></text></g><g><title>free_blocks (miniserve/memory/block_manager.py:191) (9 samples, 0.23%)</title><rect x="35.7272%" y="244" width="0.2333%" height="15" fill="rgb(247,81,37)" fg:x="1378" fg:w="9"/><text x="35.9772%" y="254.50"></text></g><g><title>blocks_freed (miniserve/memory/block_manager.py:176) (8 samples, 0.21%)</title><rect x="35.7532%" y="260" width="0.2074%" height="15" fill="rgb(209,12,38)" fg:x="1379" fg:w="8"/><text x="36.0032%" y="270.50"></text></g><g><title>free_blocks (miniserve/memory/block_manager.py:192) (6 samples, 0.16%)</title><rect x="35.9606%" y="244" width="0.1556%" height="15" fill="rgb(227,1,9)" fg:x="1387" fg:w="6"/><text x="36.2106%" y="254.50"></text></g><g><title>claimed_elsewhere (miniserve/memory/block_manager.py:135) (8 samples, 0.21%)</title><rect x="36.1939%" y="260" width="0.2074%" height="15" fill="rgb(248,47,43)" fg:x="1396" fg:w="8"/><text x="36.4439%" y="270.50"></text></g><g><title>&lt;genexpr&gt; (miniserve/memory/block_manager.py:136) (9 samples, 0.23%)</title><rect x="37.2310%" y="276" width="0.2333%" height="15" fill="rgb(221,10,30)" fg:x="1436" fg:w="9"/><text x="37.4810%" y="286.50"></text></g><g><title>claimed_elsewhere (miniserve/memory/block_manager.py:136) (57 samples, 1.48%)</title><rect x="36.4013%" y="260" width="1.4778%" height="15" fill="rgb(210,229,1)" fg:x="1404" fg:w="57"/><text x="36.6513%" y="270.50"></text></g><g><title>&lt;genexpr&gt; (miniserve/memory/block_manager.py:137) (16 samples, 0.41%)</title><rect x="37.4644%" y="276" width="0.4148%" height="15" fill="rgb(222,148,37)" fg:x="1445" fg:w="16"/><text x="37.7144%" y="286.50"></text></g><g><title>_schedule_decode (miniserve/engine/policies.py:348) (103 samples, 2.67%)</title><rect x="35.4680%" y="212" width="2.6705%" height="15" fill="rgb(234,67,33)" fg:x="1368" fg:w="103"/><text x="35.7180%" y="222.50">_s..</text></g><g><title>can_fit (miniserve/memory/block_manager.py:199) (101 samples, 2.62%)</title><rect x="35.5198%" y="228" width="2.6186%" height="15" fill="rgb(247,98,35)" fg:x="1370" fg:w="101"/><text x="35.7698%" y="238.50">ca..</text></g><g><title>free_blocks (miniserve/memory/block_manager.py:193) (78 samples, 2.02%)</title><rect x="36.1162%" y="244" width="2.0223%" height="15" fill="rgb(247,138,52)" fg:x="1393" fg:w="78"/><text x="36.3662%" y="254.50">f..</text></g><g><title>claimed_elsewhere (miniserve/memory/block_manager.py:137) (10 samples, 0.26%)</title><rect x="37.8792%" y="260" width="0.2593%" height="15" fill="rgb(213,79,30)" fg:x="1461" fg:w="10"/><text x="38.1292%" y="270.50"></text></g><g><title>&lt;genexpr&gt; (miniserve/memory/block_manager.py:136) (9 samples, 0.23%)</title><rect x="37.9051%" y="276" width="0.2333%" height="15" fill="rgb(246,177,23)" fg:x="1462" fg:w="9"/><text x="38.1551%" y="286.50"></text></g><g><title>_schedule_decode (miniserve/engine/policies.py:355) (9 samples, 0.23%)</title><rect x="38.1384%" y="212" width="0.2333%" height="15" fill="rgb(230,62,27)" fg:x="1471" fg:w="9"/><text x="38.3884%" y="222.50"></text></g><g><title>claim (miniserve/memory/block_manager.py:125) (5 samples, 0.13%)</title><rect x="38.2422%" y="228" width="0.1296%" height="15" fill="rgb(216,154,8)" fg:x="1475" fg:w="5"/><text x="38.4922%" y="238.50"></text></g><g><title>__init__ (&lt;string&gt;:3) (11 samples, 0.29%)</title><rect x="39.1755%" y="228" width="0.2852%" height="15" fill="rgb(244,35,45)" fg:x="1511" fg:w="11"/><text x="39.4255%" y="238.50"></text></g><g><title>__init__ (&lt;string&gt;:4) (11 samples, 0.29%)</title><rect x="39.4607%" y="228" width="0.2852%" height="15" fill="rgb(251,115,12)" fg:x="1522" fg:w="11"/><text x="39.7107%" y="238.50"></text></g><g><title>_schedule_decode (miniserve/engine/policies.py:357) (61 samples, 1.58%)</title><rect x="38.3718%" y="212" width="1.5815%" height="15" fill="rgb(240,54,50)" fg:x="1480" fg:w="61"/><text x="38.6218%" y="222.50"></text></g><g><title>__init__ (&lt;string&gt;:6) (6 samples, 0.16%)</title><rect x="39.7978%" y="228" width="0.1556%" height="15" fill="rgb(233,84,52)" fg:x="1535" fg:w="6"/><text x="40.0478%" y="238.50"></text></g><g><title>_build_plan (miniserve/engine/policies.py:289) (653 samples, 16.93%)</title><rect x="23.0749%" y="196" width="16.9303%" height="15" fill="rgb(207,117,47)" fg:x="890" fg:w="653"/><text x="23.3249%" y="206.50">_build_plan (miniserve/eng..</text></g><g><title>_schedule_prefill (miniserve/engine/policies.py:373) (5 samples, 0.13%)</title><rect x="40.2385%" y="212" width="0.1296%" height="15" fill="rgb(249,43,39)" fg:x="1552" fg:w="5"/><text x="40.4885%" y="222.50"></text></g><g><title>_schedule_prefill (miniserve/engine/policies.py:374) (16 samples, 0.41%)</title><rect x="40.3682%" y="212" width="0.4148%" height="15" fill="rgb(209,38,44)" fg:x="1557" fg:w="16"/><text x="40.6182%" y="222.50"></text></g><g><title>prefill_order_key (miniserve/engine/policies.py:580) (10 samples, 0.26%)</title><rect x="46.0202%" y="228" width="0.2593%" height="15" fill="rgb(236,212,23)" fg:x="1775" fg:w="10"/><text x="46.2702%" y="238.50"></text></g><g><title>_schedule_prefill (miniserve/engine/policies.py:377) (226 samples, 5.86%)</title><rect x="40.7830%" y="212" width="5.8595%" height="15" fill="rgb(242,79,21)" fg:x="1573" fg:w="226"/><text x="41.0330%" y="222.50">_schedu..</text></g><g><title>prefill_order_key (miniserve/engine/policies.py:581) (14 samples, 0.36%)</title><rect x="46.2795%" y="228" width="0.3630%" height="15" fill="rgb(211,96,35)" fg:x="1785" fg:w="14"/><text x="46.5295%" y="238.50"></text></g><g><title>_cursor (miniserve/engine/policies.py:190) (38 samples, 0.99%)</title><rect x="47.3166%" y="228" width="0.9852%" height="15" fill="rgb(253,215,40)" fg:x="1825" fg:w="38"/><text x="47.5666%" y="238.50"></text></g><g><title>_cursor (miniserve/engine/policies.py:191) (19 samples, 0.49%)</title><rect x="48.3018%" y="228" width="0.4926%" height="15" fill="rgb(211,81,21)" fg:x="1863" fg:w="19"/><text x="48.5518%" y="238.50"></text></g><g><title>num_tokens (miniserve/engine/request.py:93) (5 samples, 0.13%)</title><rect x="48.7944%" y="228" width="0.1296%" height="15" fill="rgb(208,190,38)" fg:x="1882" fg:w="5"/><text x="49.0444%" y="238.50"></text></g><g><title>_schedule_prefill (miniserve/engine/policies.py:378) (112 samples, 2.90%)</title><rect x="46.6425%" y="212" width="2.9038%" height="15" fill="rgb(235,213,38)" fg:x="1799" fg:w="112"/><text x="46.8925%" y="222.50">_s..</text></g><g><title>num_tokens (miniserve/engine/request.py:96) (24 samples, 0.62%)</title><rect x="48.9240%" y="228" width="0.6222%" height="15" fill="rgb(237,122,38)" fg:x="1887" fg:w="24"/><text x="49.1740%" y="238.50"></text></g><g><title>_schedule_prefill (miniserve/engine/policies.py:379) (22 samples, 0.57%)</title><rect x="49.5463%" y="212" width="0.5704%" height="15" fill="rgb(244,218,35)" fg:x="1911" fg:w="22"/><text x="49.7963%" y="222.50"></text></g><g><title>is_evicted (miniserve/memory/block_manager.py:168) (10 samples, 0.26%)</title><rect x="49.8574%" y="228" width="0.2593%" height="15" fill="rgb(240,68,47)" fg:x="1923" fg:w="10"/><text x="50.1074%" y="238.50"></text></g><g><title>_is_decode_work (miniserve/engine/policies.py:244) (21 samples, 0.54%)</title><rect x="50.3500%" y="228" width="0.5445%" height="15" fill="rgb(210,16,53)" fg:x="1942" fg:w="21"/><text x="50.6000%" y="238.50"></text></g><g><title>_schedule_prefill (miniserve/engine/policies.py:382) (31 samples, 0.80%)</title><rect x="50.1167%" y="212" width="0.8037%" height="15" fill="rgb(235,124,12)" fg:x="1933" fg:w="31"/><text x="50.3667%" y="222.50"></text></g><g><title>_schedule_prefill (miniserve/engine/policies.py:386) (27 samples, 0.70%)</title><rect x="50.9463%" y="212" width="0.7000%" height="15" fill="rgb(224,169,11)" fg:x="1965" fg:w="27"/><text x="51.1963%" y="222.50"></text></g><g><title>_schedule_prefill (miniserve/engine/policies.py:387) (5 samples, 0.13%)</title><rect x="51.6464%" y="212" width="0.1296%" height="15" fill="rgb(250,166,2)" fg:x="1992" fg:w="5"/><text x="51.8964%" y="222.50"></text></g><g><title>schedule (miniserve/engine/policies.py:106) (1,112 samples, 28.83%)</title><rect x="23.0231%" y="180" width="28.8307%" height="15" fill="rgb(242,216,29)" fg:x="888" fg:w="1112"/><text x="23.2731%" y="190.50">schedule (miniserve/engine/policies.py:106)</text></g><g><title>_build_plan (miniserve/engine/policies.py:291) (457 samples, 11.85%)</title><rect x="40.0052%" y="196" width="11.8486%" height="15" fill="rgb(230,116,27)" fg:x="1543" fg:w="457"/><text x="40.2552%" y="206.50">_build_plan (minis..</text></g><g><title>_evict_to_fund (miniserve/engine/policies.py:436) (76 samples, 1.97%)</title><rect x="52.2686%" y="196" width="1.9704%" height="15" fill="rgb(228,99,48)" fg:x="2016" fg:w="76"/><text x="52.5186%" y="206.50">_..</text></g><g><title>&lt;genexpr&gt; (miniserve/engine/policies.py:448) (8 samples, 0.21%)</title><rect x="54.8872%" y="212" width="0.2074%" height="15" fill="rgb(253,11,6)" fg:x="2117" fg:w="8"/><text x="55.1372%" y="222.50"></text></g><g><title>&lt;genexpr&gt; (miniserve/engine/policies.py:449) (12 samples, 0.31%)</title><rect x="55.0946%" y="212" width="0.3111%" height="15" fill="rgb(247,143,39)" fg:x="2125" fg:w="12"/><text x="55.3446%" y="222.50"></text></g><g><title>_evict_to_fund (miniserve/engine/policies.py:446) (56 samples, 1.45%)</title><rect x="54.3168%" y="196" width="1.4519%" height="15" fill="rgb(236,97,10)" fg:x="2095" fg:w="56"/><text x="54.5668%" y="206.50"></text></g><g><title>preemption_key (miniserve/engine/policies.py:523) (12 samples, 0.31%)</title><rect x="55.4576%" y="212" width="0.3111%" height="15" fill="rgb(233,208,19)" fg:x="2139" fg:w="12"/><text x="55.7076%" y="222.50"></text></g><g><title>schedule (miniserve/engine/policies.py:107) (161 samples, 4.17%)</title><rect x="51.8538%" y="180" width="4.1742%" height="15" fill="rgb(216,164,2)" fg:x="2000" fg:w="161"/><text x="52.1038%" y="190.50">sched..</text></g><g><title>_evict_to_fund (miniserve/engine/policies.py:457) (6 samples, 0.16%)</title><rect x="55.8724%" y="196" width="0.1556%" height="15" fill="rgb(220,129,5)" fg:x="2155" fg:w="6"/><text x="56.1224%" y="206.50"></text></g><g><title>schedule (miniserve/engine/policies.py:108) (4 samples, 0.10%)</title><rect x="56.0280%" y="180" width="0.1037%" height="15" fill="rgb(242,17,10)" fg:x="2161" fg:w="4"/><text x="56.2780%" y="190.50"></text></g><g><title>schedule (miniserve/engine/policies.py:134) (4 samples, 0.10%)</title><rect x="56.2095%" y="180" width="0.1037%" height="15" fill="rgb(242,107,0)" fg:x="2168" fg:w="4"/><text x="56.4595%" y="190.50"></text></g><g><title>__init__ (&lt;string&gt;:3) (6 samples, 0.16%)</title><rect x="56.5465%" y="196" width="0.1556%" height="15" fill="rgb(251,28,31)" fg:x="2181" fg:w="6"/><text x="56.7965%" y="206.50"></text></g><g><title>schedule (miniserve/engine/policies.py:135) (18 samples, 0.47%)</title><rect x="56.3132%" y="180" width="0.4667%" height="15" fill="rgb(233,223,10)" fg:x="2172" fg:w="18"/><text x="56.5632%" y="190.50"></text></g><g><title>schedule (miniserve/engine/policies.py:136) (5 samples, 0.13%)</title><rect x="56.7799%" y="180" width="0.1296%" height="15" fill="rgb(215,21,27)" fg:x="2190" fg:w="5"/><text x="57.0299%" y="190.50"></text></g><g><title>schedule (miniserve/engine/policies.py:138) (10 samples, 0.26%)</title><rect x="56.9095%" y="180" width="0.2593%" height="15" fill="rgb(232,23,21)" fg:x="2195" fg:w="10"/><text x="57.1595%" y="190.50"></text></g><g><title>claims (miniserve/memory/block_manager.py:183) (10 samples, 0.26%)</title><rect x="56.9095%" y="196" width="0.2593%" height="15" fill="rgb(244,5,23)" fg:x="2195" fg:w="10"/><text x="57.1595%" y="206.50"></text></g><g><title>step (miniserve/engine/engine.py:250) (1,677 samples, 43.48%)</title><rect x="13.7412%" y="164" width="43.4794%" height="15" fill="rgb(226,81,46)" fg:x="530" fg:w="1677"/><text x="13.9912%" y="174.50">step (miniserve/engine/engine.py:250)</text></g><g><title>step (miniserve/engine/engine.py:260) (4 samples, 0.10%)</title><rect x="57.2725%" y="164" width="0.1037%" height="15" fill="rgb(247,70,30)" fg:x="2209" fg:w="4"/><text x="57.5225%" y="174.50"></text></g><g><title>prefill_work (miniserve/engine/scheduler.py:87) (6 samples, 0.16%)</title><rect x="57.8947%" y="212" width="0.1556%" height="15" fill="rgb(212,68,19)" fg:x="2233" fg:w="6"/><text x="58.1447%" y="222.50"></text></g><g><title>time_step (miniserve/runner/simulated_runner.py:40) (43 samples, 1.11%)</title><rect x="57.5318%" y="180" width="1.1149%" height="15" fill="rgb(240,187,13)" fg:x="2219" fg:w="43"/><text x="57.7818%" y="190.50"></text></g><g><title>num_prefill_tokens (miniserve/engine/scheduler.py:97) (40 samples, 1.04%)</title><rect x="57.6095%" y="196" width="1.0371%" height="15" fill="rgb(223,113,26)" fg:x="2222" fg:w="40"/><text x="57.8595%" y="206.50"></text></g><g><title>prefill_work (miniserve/engine/scheduler.py:89) (23 samples, 0.60%)</title><rect x="58.0503%" y="212" width="0.5963%" height="15" fill="rgb(206,192,2)" fg:x="2239" fg:w="23"/><text x="58.3003%" y="222.50"></text></g><g><title>&lt;genexpr&gt; (miniserve/engine/scheduler.py:89) (15 samples, 0.39%)</title><rect x="58.2577%" y="228" width="0.3889%" height="15" fill="rgb(241,108,4)" fg:x="2247" fg:w="15"/><text x="58.5077%" y="238.50"></text></g><g><title>num_decode_requests (miniserve/engine/scheduler.py:101) (7 samples, 0.18%)</title><rect x="58.6985%" y="196" width="0.1815%" height="15" fill="rgb(247,173,49)" fg:x="2264" fg:w="7"/><text x="58.9485%" y="206.50"></text></g><g><title>decode_work (miniserve/engine/scheduler.py:93) (7 samples, 0.18%)</title><rect x="58.6985%" y="212" width="0.1815%" height="15" fill="rgb(224,114,35)" fg:x="2264" fg:w="7"/><text x="58.9485%" y="222.50"></text></g><g><title>&lt;genexpr&gt; (miniserve/engine/scheduler.py:93) (4 samples, 0.10%)</title><rect x="58.7763%" y="228" width="0.1037%" height="15" fill="rgb(245,159,27)" fg:x="2267" fg:w="4"/><text x="59.0263%" y="238.50"></text></g><g><title>time_step (miniserve/runner/simulated_runner.py:41) (10 samples, 0.26%)</title><rect x="58.6466%" y="180" width="0.2593%" height="15" fill="rgb(245,172,44)" fg:x="2262" fg:w="10"/><text x="58.8966%" y="190.50"></text></g><g><title>time_step (miniserve/runner/simulated_runner.py:42) (6 samples, 0.16%)</title><rect x="58.9059%" y="180" width="0.1556%" height="15" fill="rgb(236,23,11)" fg:x="2272" fg:w="6"/><text x="59.1559%" y="190.50"></text></g><g><title>time_step (miniserve/runner/simulated_runner.py:47) (27 samples, 0.70%)</title><rect x="59.1392%" y="180" width="0.7000%" height="15" fill="rgb(205,117,38)" fg:x="2281" fg:w="27"/><text x="59.3892%" y="190.50"></text></g><g><title>step (miniserve/engine/engine.py:276) (96 samples, 2.49%)</title><rect x="57.5058%" y="164" width="2.4890%" height="15" fill="rgb(237,72,25)" fg:x="2218" fg:w="96"/><text x="57.7558%" y="174.50">st..</text></g><g><title>time_step (miniserve/runner/simulated_runner.py:48) (6 samples, 0.16%)</title><rect x="59.8393%" y="180" width="0.1556%" height="15" fill="rgb(244,70,9)" fg:x="2308" fg:w="6"/><text x="60.0893%" y="190.50"></text></g><g><title>step (miniserve/engine/engine.py:277) (40 samples, 1.04%)</title><rect x="59.9948%" y="164" width="1.0371%" height="15" fill="rgb(217,125,39)" fg:x="2314" fg:w="40"/><text x="60.2448%" y="174.50"></text></g><g><title>execute (miniserve/runner/simulated_runner.py:34) (32 samples, 0.83%)</title><rect x="60.2022%" y="180" width="0.8297%" height="15" fill="rgb(235,36,10)" fg:x="2322" fg:w="32"/><text x="60.4522%" y="190.50"></text></g><g><title>decode_work (miniserve/engine/scheduler.py:93) (21 samples, 0.54%)</title><rect x="60.4874%" y="196" width="0.5445%" height="15" fill="rgb(251,123,47)" fg:x="2333" fg:w="21"/><text x="60.7374%" y="206.50"></text></g><g><title>_apply (miniserve/engine/engine.py:418) (7 samples, 0.18%)</title><rect x="61.5764%" y="180" width="0.1815%" height="15" fill="rgb(221,13,13)" fg:x="2375" fg:w="7"/><text x="61.8264%" y="190.50"></text></g><g><title>_apply (miniserve/engine/engine.py:420) (13 samples, 0.34%)</title><rect x="61.7578%" y="180" width="0.3370%" height="15" fill="rgb(238,131,9)" fg:x="2382" fg:w="13"/><text x="62.0078%" y="190.50"></text></g><g><title>_apply (miniserve/engine/engine.py:442) (5 samples, 0.13%)</title><rect x="62.1208%" y="180" width="0.1296%" height="15" fill="rgb(211,50,8)" fg:x="2396" fg:w="5"/><text x="62.3708%" y="190.50"></text></g><g><title>_apply (miniserve/engine/engine.py:447) (4 samples, 0.10%)</title><rect x="62.2505%" y="180" width="0.1037%" height="15" fill="rgb(245,182,24)" fg:x="2401" fg:w="4"/><text x="62.5005%" y="190.50"></text></g><g><title>_apply (miniserve/engine/engine.py:448) (29 samples, 0.75%)</title><rect x="62.3542%" y="180" width="0.7519%" height="15" fill="rgb(242,14,37)" fg:x="2405" fg:w="29"/><text x="62.6042%" y="190.50"></text></g><g><title>__init__ (&lt;string&gt;:6) (7 samples, 0.18%)</title><rect x="62.9246%" y="196" width="0.1815%" height="15" fill="rgb(246,228,12)" fg:x="2427" fg:w="7"/><text x="63.1746%" y="206.50"></text></g><g><title>_apply (miniserve/engine/engine.py:449) (14 samples, 0.36%)</title><rect x="63.1060%" y="180" width="0.3630%" height="15" fill="rgb(213,55,15)" fg:x="2434" fg:w="14"/><text x="63.3560%" y="190.50"></text></g><g><title>is_complete (miniserve/engine/request.py:120) (12 samples, 0.31%)</title><rect x="63.1579%" y="196" width="0.3111%" height="15" fill="rgb(209,9,3)" fg:x="2436" fg:w="12"/><text x="63.4079%" y="206.50"></text></g><g><title>_apply (miniserve/engine/engine.py:452) (4 samples, 0.10%)</title><rect x="63.4690%" y="180" width="0.1037%" height="15" fill="rgb(230,59,30)" fg:x="2448" fg:w="4"/><text x="63.7190%" y="190.50"></text></g><g><title>step (miniserve/engine/engine.py:283) (99 samples, 2.57%)</title><rect x="61.1875%" y="164" width="2.5668%" height="15" fill="rgb(209,121,21)" fg:x="2360" fg:w="99"/><text x="61.4375%" y="174.50">st..</text></g><g><title>_apply (miniserve/engine/engine.py:461) (7 samples, 0.18%)</title><rect x="63.5727%" y="180" width="0.1815%" height="15" fill="rgb(220,109,13)" fg:x="2452" fg:w="7"/><text x="63.8227%" y="190.50"></text></g><g><title>step (miniserve/engine/engine.py:287) (6 samples, 0.16%)</title><rect x="63.7542%" y="164" width="0.1556%" height="15" fill="rgb(232,18,1)" fg:x="2459" fg:w="6"/><text x="64.0042%" y="174.50"></text></g><g><title>_release_finished_kv (miniserve/engine/engine.py:579) (4 samples, 0.10%)</title><rect x="64.0394%" y="180" width="0.1037%" height="15" fill="rgb(215,41,42)" fg:x="2470" fg:w="4"/><text x="64.2894%" y="190.50"></text></g><g><title>num_blocks (miniserve/block_table.py:25) (10 samples, 0.26%)</title><rect x="65.2320%" y="196" width="0.2593%" height="15" fill="rgb(224,123,36)" fg:x="2516" fg:w="10"/><text x="65.4820%" y="206.50"></text></g><g><title>step (miniserve/engine/engine.py:299) (83 samples, 2.15%)</title><rect x="64.0135%" y="164" width="2.1519%" height="15" fill="rgb(240,125,3)" fg:x="2469" fg:w="83"/><text x="64.2635%" y="174.50">s..</text></g><g><title>_release_finished_kv (miniserve/engine/engine.py:580) (78 samples, 2.02%)</title><rect x="64.1431%" y="180" width="2.0223%" height="15" fill="rgb(205,98,50)" fg:x="2474" fg:w="78"/><text x="64.3931%" y="190.50">_..</text></g><g><title>num_blocks (miniserve/block_table.py:27) (26 samples, 0.67%)</title><rect x="65.4913%" y="196" width="0.6741%" height="15" fill="rgb(205,185,37)" fg:x="2526" fg:w="26"/><text x="65.7413%" y="206.50"></text></g><g><title>_allocate_kv (miniserve/engine/engine.py:618) (6 samples, 0.16%)</title><rect x="66.2432%" y="180" width="0.1556%" height="15" fill="rgb(238,207,15)" fg:x="2555" fg:w="6"/><text x="66.4932%" y="190.50"></text></g><g><title>is_active (miniserve/engine/request.py:33) (6 samples, 0.16%)</title><rect x="66.2432%" y="196" width="0.1556%" height="15" fill="rgb(213,199,42)" fg:x="2555" fg:w="6"/><text x="66.4932%" y="206.50"></text></g><g><title>blocks_for_tokens (miniserve/memory/block_manager.py:22) (4 samples, 0.10%)</title><rect x="66.3988%" y="228" width="0.1037%" height="15" fill="rgb(235,201,11)" fg:x="2561" fg:w="4"/><text x="66.6488%" y="238.50"></text></g><g><title>grow_to (miniserve/memory/block_manager.py:632) (6 samples, 0.16%)</title><rect x="66.3988%" y="196" width="0.1556%" height="15" fill="rgb(207,46,11)" fg:x="2561" fg:w="6"/><text x="66.6488%" y="206.50"></text></g><g><title>blocks_needed_to_reach (miniserve/memory/block_manager.py:391) (6 samples, 0.16%)</title><rect x="66.3988%" y="212" width="0.1556%" height="15" fill="rgb(241,35,35)" fg:x="2561" fg:w="6"/><text x="66.6488%" y="222.50"></text></g><g><title>_acquire (miniserve/memory/block_manager.py:580) (13 samples, 0.34%)</title><rect x="66.7099%" y="212" width="0.3370%" height="15" fill="rgb(243,32,47)" fg:x="2573" fg:w="13"/><text x="66.9599%" y="222.50"></text></g><g><title>grow_to (miniserve/memory/block_manager.py:645) (15 samples, 0.39%)</title><rect x="66.7099%" y="196" width="0.3889%" height="15" fill="rgb(247,202,23)" fg:x="2573" fg:w="15"/><text x="66.9599%" y="206.50"></text></g><g><title>grow_to (miniserve/memory/block_manager.py:646) (10 samples, 0.26%)</title><rect x="67.0988%" y="196" width="0.2593%" height="15" fill="rgb(219,102,11)" fg:x="2588" fg:w="10"/><text x="67.3488%" y="206.50"></text></g><g><title>append (miniserve/block_table.py:45) (10 samples, 0.26%)</title><rect x="67.0988%" y="212" width="0.2593%" height="15" fill="rgb(243,110,44)" fg:x="2588" fg:w="10"/><text x="67.3488%" y="222.50"></text></g><g><title>step (miniserve/engine/engine.py:301) (51 samples, 1.32%)</title><rect x="66.1654%" y="164" width="1.3223%" height="15" fill="rgb(222,74,54)" fg:x="2552" fg:w="51"/><text x="66.4154%" y="174.50"></text></g><g><title>_allocate_kv (miniserve/engine/engine.py:623) (42 samples, 1.09%)</title><rect x="66.3988%" y="180" width="1.0889%" height="15" fill="rgb(216,99,12)" fg:x="2561" fg:w="42"/><text x="66.6488%" y="190.50"></text></g><g><title>__init__ (&lt;string&gt;:10) (8 samples, 0.21%)</title><rect x="67.5914%" y="180" width="0.2074%" height="15" fill="rgb(226,22,26)" fg:x="2607" fg:w="8"/><text x="67.8414%" y="190.50"></text></g><g><title>step (miniserve/engine/engine.py:303) (23 samples, 0.60%)</title><rect x="67.4877%" y="164" width="0.5963%" height="15" fill="rgb(217,163,10)" fg:x="2603" fg:w="23"/><text x="67.7377%" y="174.50"></text></g><g><title>__init__ (&lt;string&gt;:8) (5 samples, 0.13%)</title><rect x="67.9544%" y="180" width="0.1296%" height="15" fill="rgb(213,25,53)" fg:x="2621" fg:w="5"/><text x="68.2044%" y="190.50"></text></g><g><title>step (miniserve/engine/engine.py:311) (5 samples, 0.13%)</title><rect x="68.1618%" y="164" width="0.1296%" height="15" fill="rgb(252,105,26)" fg:x="2629" fg:w="5"/><text x="68.4118%" y="174.50"></text></g><g><title>step (miniserve/engine/engine.py:312) (10 samples, 0.26%)</title><rect x="68.2914%" y="164" width="0.2593%" height="15" fill="rgb(220,39,43)" fg:x="2634" fg:w="10"/><text x="68.5414%" y="174.50"></text></g><g><title>&lt;genexpr&gt; (miniserve/engine/engine.py:595) (22 samples, 0.57%)</title><rect x="76.1213%" y="196" width="0.5704%" height="15" fill="rgb(229,68,48)" fg:x="2936" fg:w="22"/><text x="76.3713%" y="206.50"></text></g><g><title>__get__ (enum.py:187) (16 samples, 0.41%)</title><rect x="83.8994%" y="212" width="0.4148%" height="15" fill="rgb(252,8,32)" fg:x="3236" fg:w="16"/><text x="84.1494%" y="222.50"></text></g><g><title>__get__ (enum.py:188) (11 samples, 0.29%)</title><rect x="84.3142%" y="212" width="0.2852%" height="15" fill="rgb(223,20,43)" fg:x="3252" fg:w="11"/><text x="84.5642%" y="222.50"></text></g><g><title>__get__ (enum.py:192) (4 samples, 0.10%)</title><rect x="84.5994%" y="212" width="0.1037%" height="15" fill="rgb(229,81,49)" fg:x="3263" fg:w="4"/><text x="84.8494%" y="222.50"></text></g><g><title>__get__ (enum.py:195) (22 samples, 0.57%)</title><rect x="84.7031%" y="212" width="0.5704%" height="15" fill="rgb(236,28,36)" fg:x="3267" fg:w="22"/><text x="84.9531%" y="222.50"></text></g><g><title>value (enum.py:1325) (8 samples, 0.21%)</title><rect x="85.7143%" y="228" width="0.2074%" height="15" fill="rgb(249,185,26)" fg:x="3306" fg:w="8"/><text x="85.9643%" y="238.50"></text></g><g><title>__get__ (enum.py:197) (27 samples, 0.70%)</title><rect x="85.2735%" y="212" width="0.7000%" height="15" fill="rgb(249,174,33)" fg:x="3289" fg:w="27"/><text x="85.5235%" y="222.50"></text></g><g><title>num_generated (miniserve/engine/request.py:89) (23 samples, 0.60%)</title><rect x="85.9736%" y="212" width="0.5963%" height="15" fill="rgb(233,201,37)" fg:x="3316" fg:w="23"/><text x="86.2236%" y="222.50"></text></g><g><title>&lt;genexpr&gt; (miniserve/engine/engine.py:596) (399 samples, 10.34%)</title><rect x="76.6917%" y="196" width="10.3448%" height="15" fill="rgb(221,78,26)" fg:x="2958" fg:w="399"/><text x="76.9417%" y="206.50">&lt;genexpr&gt; (mini..</text></g><g><title>num_generated (miniserve/engine/request.py:91) (18 samples, 0.47%)</title><rect x="86.5699%" y="212" width="0.4667%" height="15" fill="rgb(250,127,30)" fg:x="3339" fg:w="18"/><text x="86.8199%" y="222.50"></text></g><g><title>_progress_fingerprint (miniserve/engine/engine.py:595) (739 samples, 19.16%)</title><rect x="68.6025%" y="180" width="19.1600%" height="15" fill="rgb(230,49,44)" fg:x="2646" fg:w="739"/><text x="68.8525%" y="190.50">_progress_fingerprint (miniser..</text></g><g><title>&lt;genexpr&gt; (miniserve/engine/engine.py:597) (28 samples, 0.73%)</title><rect x="87.0366%" y="196" width="0.7260%" height="15" fill="rgb(229,67,23)" fg:x="3357" fg:w="28"/><text x="87.2866%" y="206.50"></text></g><g><title>step (miniserve/engine/engine.py:314) (742 samples, 19.24%)</title><rect x="68.5507%" y="164" width="19.2377%" height="15" fill="rgb(249,83,47)" fg:x="2644" fg:w="742"/><text x="68.8007%" y="174.50">step (miniserve/engine/engine...</text></g><g><title>record_step (miniserve/metrics/collector.py:185) (7 samples, 0.18%)</title><rect x="87.9181%" y="180" width="0.1815%" height="15" fill="rgb(215,43,3)" fg:x="3391" fg:w="7"/><text x="88.1681%" y="190.50"></text></g><g><title>record_step (miniserve/metrics/collector.py:188) (11 samples, 0.29%)</title><rect x="88.1514%" y="180" width="0.2852%" height="15" fill="rgb(238,154,13)" fg:x="3400" fg:w="11"/><text x="88.4014%" y="190.50"></text></g><g><title>_metrics_for_id (miniserve/metrics/collector.py:246) (4 samples, 0.10%)</title><rect x="88.3329%" y="196" width="0.1037%" height="15" fill="rgb(219,56,2)" fg:x="3407" fg:w="4"/><text x="88.5829%" y="206.50"></text></g><g><title>record_step (miniserve/metrics/collector.py:189) (4 samples, 0.10%)</title><rect x="88.4366%" y="180" width="0.1037%" height="15" fill="rgb(233,0,4)" fg:x="3411" fg:w="4"/><text x="88.6866%" y="190.50"></text></g><g><title>record_step (miniserve/metrics/collector.py:212) (18 samples, 0.47%)</title><rect x="88.5662%" y="180" width="0.4667%" height="15" fill="rgb(235,30,7)" fg:x="3416" fg:w="18"/><text x="88.8162%" y="190.50"></text></g><g><title>record_step (miniserve/metrics/collector.py:215) (14 samples, 0.36%)</title><rect x="89.0589%" y="180" width="0.3630%" height="15" fill="rgb(250,79,13)" fg:x="3435" fg:w="14"/><text x="89.3089%" y="190.50"></text></g><g><title>num_scheduled_tokens (miniserve/engine/scheduler.py:85) (14 samples, 0.36%)</title><rect x="89.0589%" y="196" width="0.3630%" height="15" fill="rgb(211,146,34)" fg:x="3435" fg:w="14"/><text x="89.3089%" y="206.50"></text></g><g><title>&lt;genexpr&gt; (miniserve/engine/scheduler.py:85) (5 samples, 0.13%)</title><rect x="89.2922%" y="212" width="0.1296%" height="15" fill="rgb(228,22,38)" fg:x="3444" fg:w="5"/><text x="89.5422%" y="222.50"></text></g><g><title>record_step (miniserve/metrics/collector.py:216) (22 samples, 0.57%)</title><rect x="89.4218%" y="180" width="0.5704%" height="15" fill="rgb(235,168,5)" fg:x="3449" fg:w="22"/><text x="89.6718%" y="190.50"></text></g><g><title>num_prefill_tokens (miniserve/engine/engine.py:66) (21 samples, 0.54%)</title><rect x="89.4478%" y="196" width="0.5445%" height="15" fill="rgb(221,155,16)" fg:x="3450" fg:w="21"/><text x="89.6978%" y="206.50"></text></g><g><title>num_prefill_tokens (miniserve/engine/scheduler.py:97) (20 samples, 0.52%)</title><rect x="89.4737%" y="212" width="0.5185%" height="15" fill="rgb(215,215,53)" fg:x="3451" fg:w="20"/><text x="89.7237%" y="222.50"></text></g><g><title>prefill_work (miniserve/engine/scheduler.py:89) (10 samples, 0.26%)</title><rect x="89.7330%" y="228" width="0.2593%" height="15" fill="rgb(223,4,10)" fg:x="3461" fg:w="10"/><text x="89.9830%" y="238.50"></text></g><g><title>num_decode_requests (miniserve/engine/scheduler.py:101) (8 samples, 0.21%)</title><rect x="89.9922%" y="212" width="0.2074%" height="15" fill="rgb(234,103,6)" fg:x="3471" fg:w="8"/><text x="90.2422%" y="222.50"></text></g><g><title>decode_work (miniserve/engine/scheduler.py:93) (5 samples, 0.13%)</title><rect x="90.0700%" y="228" width="0.1296%" height="15" fill="rgb(227,97,0)" fg:x="3474" fg:w="5"/><text x="90.3200%" y="238.50"></text></g><g><title>record_step (miniserve/metrics/collector.py:217) (9 samples, 0.23%)</title><rect x="89.9922%" y="180" width="0.2333%" height="15" fill="rgb(234,150,53)" fg:x="3471" fg:w="9"/><text x="90.2422%" y="190.50"></text></g><g><title>num_decode_requests (miniserve/engine/engine.py:70) (9 samples, 0.23%)</title><rect x="89.9922%" y="196" width="0.2333%" height="15" fill="rgb(228,201,54)" fg:x="3471" fg:w="9"/><text x="90.2422%" y="206.50"></text></g><g><title>internal_fragmentation (miniserve/memory/block_manager.py:76) (7 samples, 0.18%)</title><rect x="90.4330%" y="212" width="0.1815%" height="15" fill="rgb(222,22,37)" fg:x="3488" fg:w="7"/><text x="90.6830%" y="222.50"></text></g><g><title>__init__ (&lt;string&gt;:10) (4 samples, 0.10%)</title><rect x="91.0034%" y="228" width="0.1037%" height="15" fill="rgb(237,53,32)" fg:x="3510" fg:w="4"/><text x="91.2534%" y="238.50"></text></g><g><title>__init__ (&lt;string&gt;:4) (4 samples, 0.10%)</title><rect x="91.1589%" y="228" width="0.1037%" height="15" fill="rgb(233,25,53)" fg:x="3516" fg:w="4"/><text x="91.4089%" y="238.50"></text></g><g><title>__init__ (&lt;string&gt;:5) (7 samples, 0.18%)</title><rect x="91.2626%" y="228" width="0.1815%" height="15" fill="rgb(210,40,34)" fg:x="3520" fg:w="7"/><text x="91.5126%" y="238.50"></text></g><g><title>stats (miniserve/memory/block_manager.py:680) (35 samples, 0.91%)</title><rect x="90.6663%" y="212" width="0.9074%" height="15" fill="rgb(241,220,44)" fg:x="3497" fg:w="35"/><text x="90.9163%" y="222.50"></text></g><g><title>stats (miniserve/memory/block_manager.py:682) (5 samples, 0.13%)</title><rect x="91.5738%" y="212" width="0.1296%" height="15" fill="rgb(235,28,35)" fg:x="3532" fg:w="5"/><text x="91.8238%" y="222.50"></text></g><g><title>num_used_tokens (miniserve/memory/block_manager.py:346) (9 samples, 0.23%)</title><rect x="91.8849%" y="228" width="0.2333%" height="15" fill="rgb(210,56,17)" fg:x="3544" fg:w="9"/><text x="92.1349%" y="238.50"></text></g><g><title>num_used_tokens (miniserve/memory/block_manager.py:348) (16 samples, 0.41%)</title><rect x="92.1182%" y="228" width="0.4148%" height="15" fill="rgb(224,130,29)" fg:x="3553" fg:w="16"/><text x="92.3682%" y="238.50"></text></g><g><title>num_used_tokens (miniserve/memory/block_manager.py:351) (11 samples, 0.29%)</title><rect x="92.5849%" y="228" width="0.2852%" height="15" fill="rgb(235,212,8)" fg:x="3571" fg:w="11"/><text x="92.8349%" y="238.50"></text></g><g><title>num_used_tokens (miniserve/memory/block_manager.py:352) (46 samples, 1.19%)</title><rect x="92.8701%" y="228" width="1.1926%" height="15" fill="rgb(223,33,50)" fg:x="3582" fg:w="46"/><text x="93.1201%" y="238.50"></text></g><g><title>num_used_tokens (miniserve/memory/block_manager.py:353) (5 samples, 0.13%)</title><rect x="94.0627%" y="228" width="0.1296%" height="15" fill="rgb(219,149,13)" fg:x="3628" fg:w="5"/><text x="94.3127%" y="238.50"></text></g><g><title>stats (miniserve/memory/block_manager.py:685) (103 samples, 2.67%)</title><rect x="91.8071%" y="212" width="2.6705%" height="15" fill="rgb(250,156,29)" fg:x="3541" fg:w="103"/><text x="92.0571%" y="222.50">st..</text></g><g><title>num_used_tokens (miniserve/memory/block_manager.py:354) (11 samples, 0.29%)</title><rect x="94.1924%" y="228" width="0.2852%" height="15" fill="rgb(216,193,19)" fg:x="3633" fg:w="11"/><text x="94.4424%" y="238.50"></text></g><g><title>step (miniserve/engine/engine.py:319) (269 samples, 6.97%)</title><rect x="87.8403%" y="164" width="6.9743%" height="15" fill="rgb(216,135,14)" fg:x="3388" fg:w="269"/><text x="88.0903%" y="174.50">step (min..</text></g><g><title>record_step (miniserve/metrics/collector.py:223) (175 samples, 4.54%)</title><rect x="90.2774%" y="180" width="4.5372%" height="15" fill="rgb(241,47,5)" fg:x="3482" fg:w="175"/><text x="90.5274%" y="190.50">recor..</text></g><g><title>_fragmentation (miniserve/metrics/collector.py:236) (172 samples, 4.46%)</title><rect x="90.3552%" y="196" width="4.4594%" height="15" fill="rgb(233,42,35)" fg:x="3485" fg:w="172"/><text x="90.6052%" y="206.50">_frag..</text></g><g><title>stats (miniserve/memory/block_manager.py:688) (12 samples, 0.31%)</title><rect x="94.5035%" y="212" width="0.3111%" height="15" fill="rgb(231,13,6)" fg:x="3645" fg:w="12"/><text x="94.7535%" y="222.50"></text></g><g><title>num_shared_blocks (miniserve/memory/block_manager.py:336) (9 samples, 0.23%)</title><rect x="94.5813%" y="228" width="0.2333%" height="15" fill="rgb(207,181,40)" fg:x="3648" fg:w="9"/><text x="94.8313%" y="238.50"></text></g><g><title>&lt;genexpr&gt; (miniserve/memory/block_manager.py:336) (7 samples, 0.18%)</title><rect x="94.6331%" y="244" width="0.1815%" height="15" fill="rgb(254,173,49)" fg:x="3650" fg:w="7"/><text x="94.8831%" y="254.50"></text></g><g><title>_sync_running_set (miniserve/engine/engine.py:233) (14 samples, 0.36%)</title><rect x="94.9702%" y="180" width="0.3630%" height="15" fill="rgb(221,1,38)" fg:x="3663" fg:w="14"/><text x="95.2202%" y="190.50"></text></g><g><title>is_active (miniserve/engine/request.py:33) (13 samples, 0.34%)</title><rect x="94.9961%" y="196" width="0.3370%" height="15" fill="rgb(206,124,46)" fg:x="3664" fg:w="13"/><text x="95.2461%" y="206.50"></text></g><g><title>_sync_running_set (miniserve/engine/engine.py:235) (6 samples, 0.16%)</title><rect x="95.3332%" y="180" width="0.1556%" height="15" fill="rgb(249,21,11)" fg:x="3677" fg:w="6"/><text x="95.5832%" y="190.50"></text></g><g><title>_sync_running_set (miniserve/engine/engine.py:236) (45 samples, 1.17%)</title><rect x="95.4887%" y="180" width="1.1667%" height="15" fill="rgb(222,201,40)" fg:x="3683" fg:w="45"/><text x="95.7387%" y="190.50"></text></g><g><title>is_active (miniserve/engine/request.py:33) (35 samples, 0.91%)</title><rect x="95.7480%" y="196" width="0.9074%" height="15" fill="rgb(235,61,29)" fg:x="3693" fg:w="35"/><text x="95.9980%" y="206.50"></text></g><g><title>_sync_running_set (miniserve/engine/engine.py:239) (9 samples, 0.23%)</title><rect x="96.6554%" y="180" width="0.2333%" height="15" fill="rgb(219,207,3)" fg:x="3728" fg:w="9"/><text x="96.9054%" y="190.50"></text></g><g><title>run (miniserve/benchmark/driver.py:144) (3,848 samples, 99.77%)</title><rect x="0.0519%" y="148" width="99.7667%" height="15" fill="rgb(222,56,46)" fg:x="2" fg:w="3848"/><text x="0.3019%" y="158.50">run (miniserve/benchmark/driver.py:144)</text></g><g><title>step (miniserve/engine/engine.py:322) (193 samples, 5.00%)</title><rect x="94.8146%" y="164" width="5.0039%" height="15" fill="rgb(239,76,54)" fg:x="3657" fg:w="193"/><text x="95.0646%" y="174.50">step (..</text></g><g><title>_sync_running_set (miniserve/engine/engine.py:240) (113 samples, 2.93%)</title><rect x="96.8888%" y="180" width="2.9297%" height="15" fill="rgb(231,124,27)" fg:x="3737" fg:w="113"/><text x="97.1388%" y="190.50">_s..</text></g><g><title>all (3,857 samples, 100%)</title><rect x="0.0000%" y="52" width="100.0000%" height="15" fill="rgb(249,195,6)" fg:x="0" fg:w="3857"/><text x="0.2500%" y="62.50"></text></g><g><title>_run_module_as_main (&lt;frozen runpy&gt;:204) (3,857 samples, 100.00%)</title><rect x="0.0000%" y="68" width="100.0000%" height="15" fill="rgb(237,174,47)" fg:x="0" fg:w="3857"/><text x="0.2500%" y="78.50">_run_module_as_main (&lt;frozen runpy&gt;:204)</text></g><g><title>_run_code (&lt;frozen runpy&gt;:88) (3,857 samples, 100.00%)</title><rect x="0.0000%" y="84" width="100.0000%" height="15" fill="rgb(206,201,31)" fg:x="0" fg:w="3857"/><text x="0.2500%" y="94.50">_run_code (&lt;frozen runpy&gt;:88)</text></g><g><title>&lt;module&gt; (miniserve/cli.py:257) (3,857 samples, 100.00%)</title><rect x="0.0000%" y="100" width="100.0000%" height="15" fill="rgb(231,57,52)" fg:x="0" fg:w="3857"/><text x="0.2500%" y="110.50">&lt;module&gt; (miniserve/cli.py:257)</text></g><g><title>main (miniserve/cli.py:208) (3,857 samples, 100.00%)</title><rect x="0.0000%" y="116" width="100.0000%" height="15" fill="rgb(248,177,22)" fg:x="0" fg:w="3857"/><text x="0.2500%" y="126.50">main (miniserve/cli.py:208)</text></g><g><title>run (miniserve/benchmark/benchmark.py:33) (3,857 samples, 100.00%)</title><rect x="0.0000%" y="132" width="100.0000%" height="15" fill="rgb(215,211,37)" fg:x="0" fg:w="3857"/><text x="0.2500%" y="142.50">run (miniserve/benchmark/benchmark.py:33)</text></g><g><title>run (miniserve/benchmark/driver.py:152) (6 samples, 0.16%)</title><rect x="99.8444%" y="148" width="0.1556%" height="15" fill="rgb(241,128,51)" fg:x="3851" fg:w="6"/><text x="100.0944%" y="158.50"></text></g><g><title>is_stalled (miniserve/engine/engine.py:92) (6 samples, 0.16%)</title><rect x="99.8444%" y="164" width="0.1556%" height="15" fill="rgb(227,165,31)" fg:x="3851" fg:w="6"/><text x="100.0944%" y="174.50"></text></g></svg></svg>
